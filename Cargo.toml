@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "core",
+    "ttt-core",
     "server",
     "proto"
 ]

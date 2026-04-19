@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-core = { path = "../core" }
+ttt-core = { path = "../ttt-core" }
 proto = { path = "../proto" }
