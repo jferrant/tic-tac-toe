@@ -10,15 +10,17 @@ use ttt_core::{
 
 use crate::{
     models::{CreateRequest, CreateResponse, PlayRequest, PlayResponse},
-    state::AppState,
+    state::{generate_game_id, AppState},
 };
 
 pub async fn handle_create(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<CreateRequest>,
 ) -> Result<Json<CreateResponse>, StatusCode> {
-    let message = format!("CREATE_GAME:{:?}:{:?}", payload.pubkey_x, payload.pubkey_y);
-
+    let message = format!(
+        "CREATE_GAME:{:?}:{:?}:{}",
+        payload.pubkey_x, payload.pubkey_y, payload.nonce
+    );
     let public_key =
         VerifyingKey::from_bytes(&payload.pubkey_x).map_err(|_| StatusCode::BAD_REQUEST)?;
 
@@ -29,7 +31,12 @@ pub async fn handle_create(
         .verify(message.as_bytes(), &sig)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
-    let game_id = rand::random::<u128>();
+    let game_id = generate_game_id(&payload.pubkey_x, &payload.pubkey_y, payload.nonce);
+
+    // Prevent overwriting an existing game
+    if state.game_exists(game_id) {
+        return Err(StatusCode::CONFLICT);
+    }
     let empty_leaves = [NULL_HASH; 16];
     let initial_root = compute_root_from_leaves(&empty_leaves);
     let witness = Witness {

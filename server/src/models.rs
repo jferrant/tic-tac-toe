@@ -17,6 +17,7 @@ pub struct CreateRequest {
     pub pubkey_x: Player,
     pub pubkey_y: Player,
     pub signature: Vec<u8>,
+    pub nonce: u64,
 }
 
 impl CreateRequest {
