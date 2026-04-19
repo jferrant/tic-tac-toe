@@ -22,8 +22,25 @@ pub enum StfError {
     IdenticalPlayerKeys,
     #[error("Invalid turn value found in state. Must be 1 (X) or 2 (O)")]
     InvalidTurnValue,
+    #[error("The game has already been won by another player")]
+    GameAlreadyFinished,
+    #[error("The game entered into an invalid state.")]
+    InvalidState,
 }
 
+pub const WIN_CONDITIONS: [[usize; 3]; 8] = [
+    // Rows
+    [0, 1, 2],
+    [3, 4, 5],
+    [6, 7, 8],
+    // Columns
+    [0, 3, 6],
+    [1, 4, 7],
+    [2, 5, 8],
+    // Diagonals
+    [0, 4, 8],
+    [2, 4, 6],
+];
 pub const BOARD_START_IDX: usize = 0;
 pub const BOARD_END_IDX: usize = 8;
 pub const PLAYER_X_IDX: usize = 9;
@@ -113,6 +130,28 @@ pub fn convert_coordinates_to_index(x: usize, y: usize) -> Result<usize, StfErro
     Ok(y * 3 + x)
 }
 
+/// Check if the latest move resulted in a win.
+/// Returns Some(Player) if a line is completed, otherwise None.
+fn check_winner(leaves: &[Hash; 16]) -> Option<PlayerRole> {
+    for combo in WIN_CONDITIONS {
+        let a = leaves[combo[0]];
+        let b = leaves[combo[1]];
+        let c = leaves[combo[2]];
+
+        // If all three match and are NOT empty
+        if a != hash_leaf(Cell::Empty as u8) && a == b && b == c {
+            // We need to return the actual Player (pubkey), not just the role.
+            // We look at the value in the winning cells to see if it was X or O.
+            if a == hash_leaf(PlayerRole::X as u8) {
+                return Some(PlayerRole::X);
+            } else {
+                return Some(PlayerRole::O);
+            }
+        }
+    }
+    None
+}
+
 /// Initialize the game by building the full Merkle Tree with all 16 leaves
 fn init_game(pubkey_x: &Player, pubkey_y: &Player) -> Hash {
     // Start with an array where every leaf is the NULL_HASH constant
@@ -168,6 +207,10 @@ pub fn stf(
                 return Err(StfError::InvalidMerkleProof);
             }
 
+            if check_winner(&witness.leaves).is_some() {
+                return Err(StfError::GameAlreadyFinished);
+            }
+
             // Verify turn and identify info
             let is_x_turn = witness.leaves[TURN_TRACKER_IDX] == hash_leaf(PlayerRole::X as u8);
             let is_o_turn = witness.leaves[TURN_TRACKER_IDX] == hash_leaf(PlayerRole::O as u8);
@@ -195,10 +238,128 @@ pub fn stf(
             // State Transition
             let mut new_leaves = witness.leaves;
             new_leaves[board_idx] = hash_leaf(current_role as u8);
-            new_leaves[TURN_TRACKER_IDX] = hash_leaf(current_role.next() as u8);
 
-            // TODO: handle win condition
-            Ok((compute_root_from_leaves(&new_leaves), None))
+            let winner = if let Some(winner_role) = check_winner(&new_leaves) {
+                // This should not ever happen...
+                if winner_role != current_role {
+                    return Err(StfError::InvalidState);
+                }
+                Some(pubkey)
+            } else {
+                // Only update the turn tracker if we haven't any winner.
+                new_leaves[TURN_TRACKER_IDX] = hash_leaf(current_role.next() as u8);
+                None
+            };
+            Ok((compute_root_from_leaves(&new_leaves), winner))
         }
+    }
+}
+
+mod test {
+    use super::*;
+
+    #[test]
+    fn win_detection_and_locking() {
+        let pk_x = [1u8; 32];
+        let pk_o = [2u8; 32];
+
+        // Setup: X is about to win on the top row [X, X, _]
+        let mut leaves = [hash_leaf(Cell::Empty as u8); 16];
+        leaves[0] = hash_leaf(Cell::X as u8);
+        leaves[1] = hash_leaf(Cell::X as u8);
+        leaves[PLAYER_X_IDX] = hash_leaf_from_hash(hash_bytes(&pk_x));
+        leaves[PLAYER_O_IDX] = hash_leaf_from_hash(hash_bytes(&pk_o));
+        leaves[TURN_TRACKER_IDX] = hash_leaf(PlayerRole::X as u8);
+
+        let root = compute_root_from_leaves(&leaves);
+        let witness = Witness { leaves };
+
+        // X plays at (2, 0) to complete the row
+        let move_x = PlayerMove::Play {
+            pubkey: pk_x,
+            coords: (2, 0),
+        };
+        let (new_root, winner) = stf(root, move_x, witness).expect("Winning move failed");
+
+        assert_eq!(winner, Some(pk_x), "X should be declared winner");
+
+        // Try to move again on the won board—should fail with GameAlreadyFinished
+        let mut won_leaves = leaves;
+        won_leaves[2] = hash_leaf(Cell::X as u8);
+        let won_witness = Witness { leaves: won_leaves };
+
+        let move_o = PlayerMove::Play {
+            pubkey: pk_o,
+            coords: (0, 1),
+        };
+        let result = stf(new_root, move_o, won_witness);
+
+        assert_eq!(result.unwrap_err(), StfError::GameAlreadyFinished);
+    }
+
+    #[test]
+    fn check_invalid_player_identity() {
+        let pk_x = [1u8; 32];
+        let attacker_pk = [9u8; 32];
+
+        let mut leaves = [hash_leaf(Cell::Empty as u8); 16];
+        leaves[PLAYER_X_IDX] = hash_leaf_from_hash(hash_bytes(&pk_x));
+        leaves[TURN_TRACKER_IDX] = hash_leaf(PlayerRole::X as u8);
+
+        let root = compute_root_from_leaves(&leaves);
+        let witness = Witness { leaves };
+
+        // Attacker tries to play as X
+        let move_attack = PlayerMove::Play {
+            pubkey: attacker_pk,
+            coords: (0, 0),
+        };
+        let result = stf(root, move_attack, witness);
+
+        assert_eq!(result.unwrap_err(), StfError::InvalidPlayer);
+    }
+
+    #[test]
+    fn wrong_turn_order() {
+        let pk_x = [1u8; 32];
+        let pk_o = [2u8; 32];
+
+        let mut leaves = [hash_leaf(Cell::Empty as u8); 16];
+        leaves[PLAYER_X_IDX] = hash_leaf_from_hash(hash_bytes(&pk_x));
+        leaves[PLAYER_O_IDX] = hash_leaf_from_hash(hash_bytes(&pk_o));
+        leaves[TURN_TRACKER_IDX] = hash_leaf(PlayerRole::O as u8); // It's O's turn
+
+        let root = compute_root_from_leaves(&leaves);
+        let witness = Witness { leaves };
+
+        // X tries to move out of turn
+        let move_x = PlayerMove::Play {
+            pubkey: pk_x,
+            coords: (0, 0),
+        };
+        let result = stf(root, move_x, witness);
+
+        // Should fail because pk_x doesn't match the pubkey at the current role's (O) index
+        assert_eq!(result.unwrap_err(), StfError::InvalidPlayer);
+    }
+
+    #[test]
+    fn coordinate_boundary() {
+        let pk_x = [1u8; 32];
+        let mut leaves = [hash_leaf(Cell::Empty as u8); 16];
+        leaves[PLAYER_X_IDX] = hash_leaf_from_hash(hash_bytes(&pk_x));
+        leaves[TURN_TRACKER_IDX] = hash_leaf(PlayerRole::X as u8);
+
+        let root = compute_root_from_leaves(&leaves);
+        let witness = Witness { leaves };
+
+        // Test extreme out of bounds
+        let move_bad = PlayerMove::Play {
+            pubkey: pk_x,
+            coords: (3, 0),
+        };
+        let result = stf(root, move_bad, witness);
+
+        assert_eq!(result.unwrap_err(), StfError::OutOfBounds(3, 0));
     }
 }
