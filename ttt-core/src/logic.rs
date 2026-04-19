@@ -101,6 +101,7 @@ pub struct Witness {
 }
 
 /// A list of valid player moves
+#[derive(serde::Deserialize)]
 pub enum PlayerMove {
     CreateGame {
         /// The pubkey of the first player (X's)
@@ -152,8 +153,8 @@ fn check_winner(leaves: &[Hash; 16]) -> Option<PlayerRole> {
     None
 }
 
-/// Initialize the game by building the full Merkle Tree with all 16 leaves
-fn init_game(pubkey_x: &Player, pubkey_y: &Player) -> Hash {
+/// Create the leaves for a new game
+pub fn new_game(pubkey_x: &Player, pubkey_y: &Player) -> [Hash; TREE_SIZE] {
     // Start with an array where every leaf is the NULL_HASH constant
     let mut leaves = [NULL_HASH; TREE_SIZE];
 
@@ -173,7 +174,12 @@ fn init_game(pubkey_x: &Player, pubkey_y: &Player) -> Hash {
 
     // Note: Indices 12–15 remain NULL_HASH as defined at the start of the function.
     // This distinguishes "game state" leaves from "padding" leaves.
-    compute_root_from_leaves(&leaves)
+    leaves
+}
+
+/// Initialize the game by building the full Merkle Tree with all 16 leaves
+fn init_game(pubkey_x: &Player, pubkey_y: &Player) -> Hash {
+    compute_root_from_leaves(&new_game(pubkey_x, pubkey_y))
 }
 
 /// The State Transition Function (STF) that determines if a move is valid or not
@@ -181,8 +187,8 @@ fn init_game(pubkey_x: &Player, pubkey_y: &Player) -> Hash {
 /// The STF is stateless, using the Merkle Tree to construct its state each time
 pub fn stf(
     prior_merkle_root_hash: Hash,
-    player_move: PlayerMove,
-    witness: Witness,
+    player_move: &PlayerMove,
+    witness: &Witness,
 ) -> Result<(Hash, Option<Winner>), StfError> {
     match player_move {
         PlayerMove::CreateGame { pubkey_x, pubkey_y } => {
@@ -194,7 +200,7 @@ pub fn stf(
             if pubkey_x == pubkey_y {
                 return Err(StfError::IdenticalPlayerKeys);
             }
-            Ok((init_game(&pubkey_x, &pubkey_y), None))
+            Ok((init_game(pubkey_x, pubkey_y), None))
         }
         PlayerMove::Play { pubkey, coords } => {
             // We don't have a game yet
@@ -224,7 +230,7 @@ pub fn stf(
             };
 
             // This part is perfect - handles the double-hash correctly
-            let identity_leaf = hash_leaf_from_hash(hash_bytes(&pubkey));
+            let identity_leaf = hash_leaf_from_hash(hash_bytes(pubkey));
             if witness.leaves[current_role.pubkey_index()] != identity_leaf {
                 return Err(StfError::InvalidPlayer);
             }
@@ -244,10 +250,8 @@ pub fn stf(
                 if winner_role != current_role {
                     return Err(StfError::InvalidState);
                 }
-                Some(pubkey)
+                Some(*pubkey)
             } else {
-                // Only update the turn tracker if we haven't any winner.
-                new_leaves[TURN_TRACKER_IDX] = hash_leaf(current_role.next() as u8);
                 None
             };
             Ok((compute_root_from_leaves(&new_leaves), winner))
@@ -255,6 +259,7 @@ pub fn stf(
     }
 }
 
+#[cfg(test)]
 mod test {
     use super::*;
 
@@ -279,7 +284,7 @@ mod test {
             pubkey: pk_x,
             coords: (2, 0),
         };
-        let (new_root, winner) = stf(root, move_x, witness).expect("Winning move failed");
+        let (new_root, winner) = stf(root, &move_x, &witness).expect("Winning move failed");
 
         assert_eq!(winner, Some(pk_x), "X should be declared winner");
 
@@ -292,7 +297,7 @@ mod test {
             pubkey: pk_o,
             coords: (0, 1),
         };
-        let result = stf(new_root, move_o, won_witness);
+        let result = stf(new_root, &move_o, &won_witness);
 
         assert_eq!(result.unwrap_err(), StfError::GameAlreadyFinished);
     }
@@ -314,7 +319,7 @@ mod test {
             pubkey: attacker_pk,
             coords: (0, 0),
         };
-        let result = stf(root, move_attack, witness);
+        let result = stf(root, &move_attack, &witness);
 
         assert_eq!(result.unwrap_err(), StfError::InvalidPlayer);
     }
@@ -337,7 +342,7 @@ mod test {
             pubkey: pk_x,
             coords: (0, 0),
         };
-        let result = stf(root, move_x, witness);
+        let result = stf(root, &move_x, &witness);
 
         // Should fail because pk_x doesn't match the pubkey at the current role's (O) index
         assert_eq!(result.unwrap_err(), StfError::InvalidPlayer);
@@ -358,7 +363,7 @@ mod test {
             pubkey: pk_x,
             coords: (3, 0),
         };
-        let result = stf(root, move_bad, witness);
+        let result = stf(root, &move_bad, &witness);
 
         assert_eq!(result.unwrap_err(), StfError::OutOfBounds(3, 0));
     }
