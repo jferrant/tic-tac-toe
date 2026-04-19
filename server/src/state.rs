@@ -36,26 +36,46 @@ impl AppState {
 
     /// Create the raw data from the handler
     pub fn create_game(&self, game_id: u128, pk_x: &Player, pk_o: &Player) -> Result<(), String> {
-        let mut games = self.games.write().expect("Lock poisoned");
+        // Acquire the write lock so no one else adds a game with the same id as me
+        let mut games = self
+            .games
+            .write()
+            .map_err(|_| "Lock poisoned".to_string())?;
+
         if games.contains_key(&game_id) {
-            return Err("Failed to create game. Game ID {game_id} already exists.".into());
+            // Use format! so the actual ID shows up in your logs/error response
+            return Err(format!("Conflict: Game ID {game_id} already exists."));
         }
+
+        // Get the leaves
         let game = new_game(pk_x, pk_o);
         games.insert(game_id, game);
+
         Ok(())
     }
 
     /// Attempt to apply a move to the given game id
-    pub fn apply_move(&self, game_id: u128, x: usize, y: usize, role: PlayerRole) {
-        let mut games = self.games.write().expect("Lock poisoned");
-        if let Some(leaves) = games.get_mut(&game_id) {
-            let idx = y * 3 + x;
-            leaves[idx] = hash_leaf(role as u8);
-            leaves[TURN_TRACKER_IDX] = hash_leaf(role.next() as u8);
-            info!("{role:?} applied a mark to ({x}, {y}");
-        } else {
-            warn!("Game id ({game_id}) was not found. Not applying move.");
-        }
+    pub fn apply_move(
+        &self,
+        game_id: u128,
+        x: usize,
+        y: usize,
+        role: PlayerRole,
+    ) -> Result<(), String> {
+        let mut games = self
+            .games
+            .write()
+            .map_err(|_| "Lock poisoned".to_string())?;
+        let leaves = games.get_mut(&game_id).ok_or_else(|| {
+            let err = format!("Game id ({game_id}) was not found.");
+            warn!("{err}");
+            err
+        })?;
+        let idx = y * 3 + x;
+        leaves[idx] = hash_leaf(role as u8);
+        leaves[TURN_TRACKER_IDX] = hash_leaf(role.next() as u8);
+        info!("{role:?} applied a mark to ({x}, {y}");
+        Ok(())
     }
 
     /// Helper to get a copy of leaves for witness construction

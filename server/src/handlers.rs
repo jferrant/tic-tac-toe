@@ -101,7 +101,9 @@ pub async fn handle_play(
         stf(prior_root, &core_move, &Witness { leaves }).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // Update our game state
-    state.apply_move(gid, x, y, current_role);
+    state
+        .apply_move(gid, x, y, current_role)
+        .map_err(|_| StatusCode::NOT_FOUND)?;
 
     if let Some(winner_pk) = winner {
         info!("WINNER! {winner_pk:?} won game {gid}");
