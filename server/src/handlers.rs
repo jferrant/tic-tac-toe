@@ -4,8 +4,8 @@ use axum::{extract::State, http::StatusCode, Json};
 use ed25519_dalek::{Verifier, VerifyingKey};
 use tracing::{info, warn};
 use ttt_core::{
-    logic::{stf, PlayerMove, PlayerRole, Witness, TURN_TRACKER_IDX},
-    merkle::{compute_root_from_leaves, hash_leaf, NULL_HASH},
+    logic::{stf, PlayerMove, Witness},
+    merkle::{compute_root_from_leaves, NULL_HASH},
 };
 
 use crate::{
@@ -43,19 +43,14 @@ pub async fn handle_create(
         leaves: empty_leaves,
     };
 
-    // Capture the pks before we move the payload
-    let pk_x = payload.pubkey_x;
-    let pk_y = payload.pubkey_y;
     let core_move = PlayerMove::from(payload);
-
-    // FIX: Match the 3-tuple return (root, leaves, winner)
-    let (_genesis_root, _) = stf(initial_root, &core_move, &witness).map_err(|e| {
+    let (_genesis_root, new_leaves, _) = stf(initial_root, &core_move, &witness).map_err(|e| {
         warn!("Failed to initialize game: {e:?}");
         StatusCode::BAD_REQUEST
     })?;
 
     state
-        .create_game(game_id, &pk_x, &pk_y)
+        .create_game(game_id, new_leaves)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(CreateResponse { game_id }))
@@ -87,23 +82,16 @@ pub async fn handle_play(
         .verify(message.as_bytes(), &sig)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
-    // Determine which player we are
-    let current_role = if leaves[TURN_TRACKER_IDX] == hash_leaf(PlayerRole::X as u8) {
-        PlayerRole::X
-    } else {
-        PlayerRole::O
-    };
-
     let core_move = PlayerMove::from(payload);
     // make sure the STF is satisfied. This will also verify that not just any random pubkey is attempting
     // to make a move for either of our players.
-    let (new_root, winner) =
+    let (new_root, new_leaves, winner) =
         stf(prior_root, &core_move, &Witness { leaves }).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // Update our game state
     state
-        .apply_move(gid, x, y, current_role)
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+        .update_game_state(gid, new_leaves)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if let Some(winner_pk) = winner {
         info!("WINNER! {winner_pk:?} won game {gid}");

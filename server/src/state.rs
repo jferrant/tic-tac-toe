@@ -1,9 +1,8 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use tracing::{info, warn};
-use ttt_core::logic::{new_game, Player, PlayerRole, TURN_TRACKER_IDX};
-use ttt_core::merkle::{hash_bytes, hash_leaf, Hash};
+use ttt_core::logic::Player;
+use ttt_core::merkle::{hash_bytes, Hash};
 
 #[derive(Default)]
 pub struct AppState {
@@ -35,7 +34,7 @@ impl AppState {
     }
 
     /// Create the raw data from the handler
-    pub fn create_game(&self, game_id: u128, pk_x: &Player, pk_o: &Player) -> Result<(), String> {
+    pub fn create_game(&self, game_id: u128, leaves: [Hash; 16]) -> Result<(), String> {
         // Acquire the write lock so no one else adds a game with the same id as me
         let mut games = self
             .games
@@ -47,35 +46,19 @@ impl AppState {
             return Err(format!("Conflict: Game ID {game_id} already exists."));
         }
 
-        // Get the leaves
-        let game = new_game(pk_x, pk_o);
-        games.insert(game_id, game);
-
+        games.insert(game_id, leaves);
         Ok(())
     }
 
-    /// Attempt to apply a move to the given game id
-    pub fn apply_move(
-        &self,
-        game_id: u128,
-        x: usize,
-        y: usize,
-        role: PlayerRole,
-    ) -> Result<(), String> {
-        let mut games = self
-            .games
-            .write()
-            .map_err(|_| "Lock poisoned".to_string())?;
-        let leaves = games.get_mut(&game_id).ok_or_else(|| {
-            let err = format!("Game id ({game_id}) was not found.");
-            warn!("{err}");
-            err
-        })?;
-        let idx = y * 3 + x;
-        leaves[idx] = hash_leaf(role as u8);
-        leaves[TURN_TRACKER_IDX] = hash_leaf(role.next() as u8);
-        info!("{role:?} applied a mark to ({x}, {y}");
-        Ok(())
+    /// Update the game state using the provided new leaves.
+    pub fn update_game_state(&self, game_id: u128, new_leaves: [Hash; 16]) -> Result<(), String> {
+        let mut games = self.games.write().map_err(|_| "Lock poisoned")?;
+        if let Some(game) = games.get_mut(&game_id) {
+            *game = new_leaves;
+            Ok(())
+        } else {
+            Err("Game ID {game_id} not found".to_string())
+        }
     }
 
     /// Helper to get a copy of leaves for witness construction

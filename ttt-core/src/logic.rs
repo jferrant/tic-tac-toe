@@ -153,8 +153,8 @@ fn check_winner(leaves: &[Hash; 16]) -> Option<PlayerRole> {
     None
 }
 
-/// Create the leaves for a new game
-pub fn new_game(pubkey_x: &Player, pubkey_y: &Player) -> [Hash; TREE_SIZE] {
+/// Initialize the game by building the full Merkle Tree with all 16 leaves
+fn init_game(pubkey_x: &Player, pubkey_y: &Player) -> (Hash, [[u8; 32]; 16]) {
     // Start with an array where every leaf is the NULL_HASH constant
     let mut leaves = [NULL_HASH; TREE_SIZE];
 
@@ -174,12 +174,8 @@ pub fn new_game(pubkey_x: &Player, pubkey_y: &Player) -> [Hash; TREE_SIZE] {
 
     // Note: Indices 12–15 remain NULL_HASH as defined at the start of the function.
     // This distinguishes "game state" leaves from "padding" leaves.
-    leaves
-}
 
-/// Initialize the game by building the full Merkle Tree with all 16 leaves
-fn init_game(pubkey_x: &Player, pubkey_y: &Player) -> Hash {
-    compute_root_from_leaves(&new_game(pubkey_x, pubkey_y))
+    (compute_root_from_leaves(&leaves), leaves)
 }
 
 /// The State Transition Function (STF) that determines if a move is valid or not
@@ -189,7 +185,9 @@ pub fn stf(
     prior_merkle_root_hash: Hash,
     player_move: &PlayerMove,
     witness: &Witness,
-) -> Result<(Hash, Option<Winner>), StfError> {
+) -> Result<(Hash, [Hash; 16], Option<Winner>), StfError> {
+    // Return the 16 leaves too!
+
     match player_move {
         PlayerMove::CreateGame { pubkey_x, pubkey_y } => {
             // Make sure we don't overwrite an existing game
@@ -200,7 +198,8 @@ pub fn stf(
             if pubkey_x == pubkey_y {
                 return Err(StfError::IdenticalPlayerKeys);
             }
-            Ok((init_game(pubkey_x, pubkey_y), None))
+            let (new_hash, new_leaves) = init_game(pubkey_x, pubkey_y);
+            Ok((new_hash, new_leaves, None))
         }
         PlayerMove::Play { pubkey, coords } => {
             // We don't have a game yet
@@ -244,6 +243,7 @@ pub fn stf(
             // State Transition
             let mut new_leaves = witness.leaves;
             new_leaves[board_idx] = hash_leaf(current_role as u8);
+            new_leaves[TURN_TRACKER_IDX] = hash_leaf(current_role.next() as u8);
 
             let winner = if let Some(winner_role) = check_winner(&new_leaves) {
                 // This should not ever happen...
@@ -254,7 +254,7 @@ pub fn stf(
             } else {
                 None
             };
-            Ok((compute_root_from_leaves(&new_leaves), winner))
+            Ok((compute_root_from_leaves(&new_leaves), new_leaves, winner))
         }
     }
 }
@@ -284,22 +284,35 @@ mod test {
             pubkey: pk_x,
             coords: (2, 0),
         };
-        let (new_root, winner) = stf(root, &move_x, &witness).expect("Winning move failed");
+        let (new_root, new_leaves, winner) =
+            stf(root, &move_x, &witness).expect("Winning move failed");
 
+        assert_ne!(new_leaves, leaves);
         assert_eq!(winner, Some(pk_x), "X should be declared winner");
 
         // Try to move again on the won board—should fail with GameAlreadyFinished
         let mut won_leaves = leaves;
         won_leaves[2] = hash_leaf(Cell::X as u8);
+        won_leaves[TURN_TRACKER_IDX] = hash_leaf(PlayerRole::O as u8); // STF toggled this!
+
+        assert_eq!(new_leaves, won_leaves);
+
         let won_witness = Witness { leaves: won_leaves };
 
+        // 2. Attempt a move after the win
         let move_o = PlayerMove::Play {
             pubkey: pk_o,
             coords: (0, 1),
         };
+
+        // This should now pass the Merkle check and hit the GameAlreadyFinished check
         let result = stf(new_root, &move_o, &won_witness);
 
-        assert_eq!(result.unwrap_err(), StfError::GameAlreadyFinished);
+        assert_eq!(
+            result.unwrap_err(),
+            StfError::GameAlreadyFinished,
+            "Should fail because the board already shows a winner"
+        );
     }
 
     #[test]
@@ -366,5 +379,118 @@ mod test {
         let result = stf(root, &move_bad, &witness);
 
         assert_eq!(result.unwrap_err(), StfError::OutOfBounds(3, 0));
+    }
+    #[test]
+    fn successful_move_and_turn_toggle() {
+        let pk_x = [1u8; 32];
+        let pk_o = [2u8; 32];
+
+        let (root, leaves) = init_game(&pk_x, &pk_o);
+        let witness = Witness { leaves };
+
+        let move_x = PlayerMove::Play {
+            pubkey: pk_x,
+            coords: (0, 0),
+        };
+
+        let (new_root, new_leaves, winner) = stf(root, &move_x, &witness).expect("X move failed");
+        assert_ne!(new_leaves, leaves);
+
+        // Manually reconstruct what we expect the leaves to look like
+        let mut expected_leaves = leaves;
+        expected_leaves[0] = hash_leaf(Cell::X as u8); // X at (0,0)
+        expected_leaves[TURN_TRACKER_IDX] = hash_leaf(PlayerRole::O as u8); // Now O's turn
+
+        assert_eq!(new_leaves, expected_leaves);
+
+        let expected_root = compute_root_from_leaves(&expected_leaves);
+
+        assert_eq!(
+            new_root, expected_root,
+            "STF did not produce the expected Merkle root"
+        );
+        assert!(winner.is_none());
+    }
+
+    #[test]
+    fn full_board_draw() {
+        let pk_x = [1u8; 32];
+        let pk_o = [2u8; 32];
+
+        // Create a board with 8 cells filled in a way that no one has won yet
+        // X O X
+        // X O O
+        // O X _  <- X is about to move here
+        let (_, mut leaves) = init_game(&pk_x, &pk_o);
+        let cells = [
+            Cell::X,
+            Cell::O,
+            Cell::X,
+            Cell::X,
+            Cell::O,
+            Cell::O,
+            Cell::O,
+            Cell::X,
+            Cell::Empty,
+        ];
+        for (i, cell) in cells.iter().enumerate() {
+            leaves[i] = hash_leaf(*cell as u8);
+        }
+        leaves[TURN_TRACKER_IDX] = hash_leaf(PlayerRole::X as u8);
+
+        let root = compute_root_from_leaves(&leaves);
+        let witness = Witness { leaves };
+
+        let move_x = PlayerMove::Play {
+            pubkey: pk_x,
+            coords: (2, 2),
+        };
+
+        let (_, _, winner) = stf(root, &move_x, &witness).expect("Draw move failed");
+        assert!(winner.is_none(), "There should be no winner in a draw");
+    }
+
+    #[test]
+    fn cell_already_occupied() {
+        let pk_x = [1u8; 32];
+        let pk_o = [2u8; 32];
+        let (_, mut leaves) = init_game(&pk_x, &pk_o);
+
+        // Set (0,0) to X already
+        leaves[0] = hash_leaf(Cell::X as u8);
+        leaves[TURN_TRACKER_IDX] = hash_leaf(PlayerRole::O as u8);
+
+        let root = compute_root_from_leaves(&leaves);
+        let witness = Witness { leaves };
+
+        let move_o = PlayerMove::Play {
+            pubkey: pk_o,
+            coords: (0, 0),
+        };
+
+        let result = stf(root, &move_o, &witness);
+        assert_eq!(result.unwrap_err(), StfError::CellNotEmpty(0, 0));
+    }
+
+    #[test]
+    fn invalid_merkle_witness() {
+        let pk_x = [1u8; 32];
+        let pk_o = [2u8; 32];
+        let (root, leaves) = init_game(&pk_x, &pk_o);
+
+        // Corrupt the witness by changing a padding leaf
+        let mut corrupt_leaves = leaves;
+        corrupt_leaves[15] = hash_leaf(99);
+        let witness = Witness {
+            leaves: corrupt_leaves,
+        };
+
+        let move_x = PlayerMove::Play {
+            pubkey: pk_x,
+            coords: (0, 0),
+        };
+
+        let result = stf(root, &move_x, &witness);
+        assert_eq!(result.unwrap_err(), StfError::InvalidMerkleProof);
     }
 }
