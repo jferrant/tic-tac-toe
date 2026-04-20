@@ -70,6 +70,34 @@ impl From<CreateRequest> for PlayerMove {
     }
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct BatchMoveRequest {
+    pub x: usize,
+    pub y: usize,
+    pub signature: Vec<u8>,
+}
+
+impl BatchMoveRequest {
+    pub fn signature_bytes(&self) -> Result<[u8; 64], String> {
+        self.signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| "Invalid signature length".to_string())
+    }
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct BatchRequest {
+    pub game_id: u128,
+    pub moves: Vec<BatchMoveRequest>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct BatchResponse {
+    pub new_root: Hash,
+    pub winner: Option<Player>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

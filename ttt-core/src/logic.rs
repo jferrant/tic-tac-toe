@@ -274,6 +274,107 @@ pub fn verify_signature(
         .map_err(|_| StfError::InvalidSignature)
 }
 
+/// A single move in a batch proof. Each carries only `coords` and `signature`
+/// (72 bytes) because board/turn/pubkeys are threaded through `batch_stf` internally.
+pub struct BatchMove {
+    pub coords: (usize, usize),
+    pub signature: [u8; 64],
+}
+
+/// Batched State Transition Function.
+///
+/// Verifies and applies a sequence of moves in one shot, suitable for a single ZK proof.
+///
+/// **Witness sizes vs. individual STF calls:**
+/// - Individual: 106 bytes × N moves
+/// - Batch: 74 bytes (initial state) + 72 bytes × N moves
+///
+/// After the first move the savings grow because board/turn/pubkeys are not
+/// re-transmitted per move, only coords (8 bytes) + signature (64 bytes).
+pub fn batch_stf(
+    prior_root: Hash,
+    initial_board: [Cell; 9],
+    initial_turn: PlayerRole,
+    pk_x: Player,
+    pk_o: Player,
+    moves: &[BatchMove],
+) -> Result<(Hash, [Cell; 9], PlayerRole, Option<Winner>), StfError> {
+    if prior_root == NULL_HASH {
+        return Err(StfError::GameNotInitialized);
+    }
+
+    // Determine current/other from initial turn and verify against the trusted root.
+    let (init_current, init_other) = match initial_turn {
+        PlayerRole::X => (&pk_x, &pk_o),
+        PlayerRole::O => (&pk_o, &pk_x),
+    };
+    let mut leaves = build_leaves(init_current, init_other, &initial_board, initial_turn);
+    if compute_root_from_leaves(&leaves) != prior_root {
+        return Err(StfError::InvalidMerkleProof);
+    }
+
+    let mut current_root = prior_root;
+    let mut board = initial_board;
+    let mut turn = initial_turn;
+
+    for batch_move in moves {
+        let current_turn = turn;
+        let pubkey = match current_turn {
+            PlayerRole::X => pk_x,
+            PlayerRole::O => pk_o,
+        };
+
+        // Verify signature over (pubkey, coords, current_root) — same format as single STF.
+        let player_move = PlayerMove::Play {
+            pubkey,
+            coords: batch_move.coords,
+        };
+        verify_signature(
+            &pubkey,
+            &format_auth_message(&player_move, current_root),
+            &batch_move.signature,
+        )?;
+
+        if check_winner(&leaves).is_some() {
+            return Err(StfError::GameAlreadyFinished);
+        }
+
+        let board_idx = convert_coordinates_to_index(batch_move.coords.0, batch_move.coords.1)?;
+        if board[board_idx] != Cell::Empty {
+            return Err(StfError::CellNotEmpty(
+                batch_move.coords.0,
+                batch_move.coords.1,
+            ));
+        }
+
+        // Apply move.
+        board[board_idx] = match current_turn {
+            PlayerRole::X => Cell::X,
+            PlayerRole::O => Cell::O,
+        };
+        leaves[board_idx] = hash_leaf(current_turn as u8);
+
+        let next_turn = current_turn.next();
+        leaves[TURN_TRACKER_IDX] = hash_leaf(next_turn as u8);
+        current_root = compute_root_from_leaves(&leaves);
+
+        if let Some(winner_role) = check_winner(&leaves) {
+            if winner_role != current_turn {
+                return Err(StfError::InvalidState);
+            }
+            let winner_pk = match current_turn {
+                PlayerRole::X => pk_x,
+                PlayerRole::O => pk_o,
+            };
+            return Ok((current_root, board, next_turn, Some(winner_pk)));
+        }
+
+        turn = next_turn;
+    }
+
+    Ok((current_root, board, turn, None))
+}
+
 /// Pure State Transition Function.
 ///
 /// Returns `(new_merkle_root, Option<winner_pubkey>)`.

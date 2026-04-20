@@ -2,11 +2,15 @@ use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, Json};
 use tracing::{info, warn};
-use ttt_core::logic::{convert_coordinates_to_index, stf, Cell, PlayerMove, PlayerRole, Witness};
+use ttt_core::logic::{
+    batch_stf, convert_coordinates_to_index, stf, BatchMove, Cell, PlayerMove, PlayerRole, Witness,
+};
 use ttt_core::merkle::NULL_HASH;
 
 use crate::{
-    models::{CreateRequest, CreateResponse, PlayRequest, PlayResponse},
+    models::{
+        BatchRequest, BatchResponse, CreateRequest, CreateResponse, PlayRequest, PlayResponse,
+    },
     state::{generate_game_id, AppState, StoredGame},
 };
 
@@ -106,4 +110,45 @@ pub async fn handle_play(
     }
 
     Ok(Json(PlayResponse { new_root, winner }))
+}
+
+pub async fn handle_batch(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<BatchRequest>,
+) -> Result<Json<BatchResponse>, StatusCode> {
+    let gid = payload.game_id;
+    let StoredGame {
+        root: prior_root,
+        board,
+        turn,
+        pk_x,
+        pk_o,
+    } = state.get_game(gid).ok_or(StatusCode::NOT_FOUND)?;
+
+    let moves: Vec<BatchMove> = payload
+        .moves
+        .iter()
+        .map(|m| {
+            Ok(BatchMove {
+                coords: (m.x, m.y),
+                signature: m.signature_bytes().map_err(|_| StatusCode::BAD_REQUEST)?,
+            })
+        })
+        .collect::<Result<_, StatusCode>>()?;
+
+    let (new_root, new_board, new_turn, winner) =
+        batch_stf(prior_root, board, turn, pk_x, pk_o, &moves).map_err(|e| {
+            warn!("batch_stf rejected for game {gid}: {e:?}");
+            StatusCode::BAD_REQUEST
+        })?;
+
+    state
+        .update_game(gid, new_root, new_board, new_turn)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if winner.is_some() {
+        info!("Game {gid} finished via batch. Winner: {winner:?}");
+    }
+
+    Ok(Json(BatchResponse { new_root, winner }))
 }

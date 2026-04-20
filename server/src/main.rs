@@ -12,7 +12,7 @@ use tokio::net::TcpListener;
 use axum::{routing::post, Router};
 
 use server::{
-    handlers::{handle_create, handle_play},
+    handlers::{handle_batch, handle_create, handle_play},
     state::AppState,
 };
 
@@ -53,6 +53,7 @@ async fn main() {
     let app = Router::new()
         .route("/game/create", post(handle_create))
         .route("/game/play", post(handle_play))
+        .route("/game/play_batch", post(handle_batch))
         .with_state(shared_state);
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port)
