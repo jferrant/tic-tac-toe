@@ -48,7 +48,6 @@ impl PlayRequest {
 #[derive(serde::Deserialize, serde::Serialize)]
 pub struct PlayResponse {
     pub new_root: Hash,
-    pub new_leaves: [Hash; 16],
     pub winner: Option<Player>,
 }
 

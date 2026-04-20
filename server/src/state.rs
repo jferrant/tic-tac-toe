@@ -1,84 +1,81 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use ttt_core::logic::Player;
+use ttt_core::logic::{Cell, Player, PlayerRole};
 use ttt_core::merkle::{hash_bytes, Hash};
+
+/// Per-game state stored by the server.
+/// Keeps a compact representation so witness construction is trivial.
+#[derive(Clone)]
+pub struct StoredGame {
+    pub root: Hash,
+    pub board: [Cell; 9],
+    pub turn: PlayerRole,
+    pub pk_x: Player,
+    pub pk_o: Player,
+}
 
 #[derive(Default)]
 pub struct AppState {
-    pub games: RwLock<HashMap<u128, [Hash; 16]>>,
-    next_id: RwLock<u128>,
+    pub games: RwLock<HashMap<u128, StoredGame>>,
 }
 
-/// Helper function to generate a unique game id.
-/// The creator (pk_x) is always assigned the role of X.
 pub fn generate_game_id(pk_x: &Player, pk_y: &Player, nonce: u128) -> u128 {
-    // 32 (pk_x) + 32 (pk_y) + 16 (u128 nonce) = 80 bytes
     let mut inputs = Vec::with_capacity(80);
     inputs.extend_from_slice(pk_x);
     inputs.extend_from_slice(pk_y);
     inputs.extend_from_slice(&nonce.to_be_bytes());
-
     let hash = hash_bytes(&inputs);
-
-    // Take the first 16 bytes of the hash to create a u128 game identifier
     let mut id_bytes = [0u8; 16];
     id_bytes.copy_from_slice(&hash[..16]);
     u128::from_be_bytes(id_bytes)
 }
 
 impl AppState {
-    pub fn get_next_game_id(&self) -> u128 {
-        let mut id_gen = self.next_id.write().unwrap();
-        let id = *id_gen;
-        *id_gen += 1;
-        id
+    pub fn game_exists(&self, game_id: u128) -> bool {
+        self.games
+            .read()
+            .expect("Lock poisoned")
+            .contains_key(&game_id)
     }
 
-    /// Create the raw data from the handler
-    pub fn create_game(&self, game_id: u128, leaves: [Hash; 16]) -> Result<(), String> {
-        // Acquire the write lock so no one else adds a game with the same id as me
+    pub fn create_game(&self, game_id: u128, game: StoredGame) -> Result<(), String> {
         let mut games = self
             .games
             .write()
             .map_err(|_| "Lock poisoned".to_string())?;
-
         if games.contains_key(&game_id) {
-            // Use format! so the actual ID shows up in your logs/error response
             return Err(format!("Conflict: Game ID {game_id} already exists."));
         }
-
-        games.insert(game_id, leaves);
+        games.insert(game_id, game);
         Ok(())
     }
 
-    /// Update the game state using the provided new leaves.
-    pub fn update_game_state(&self, game_id: u128, new_leaves: [Hash; 16]) -> Result<(), String> {
-        let mut games = self.games.write().map_err(|_| "Lock poisoned")?;
-        if let Some(game) = games.get_mut(&game_id) {
-            *game = new_leaves;
-            Ok(())
-        } else {
-            Err("Game ID {game_id} not found".to_string())
-        }
-    }
-
-    /// Helper to get a copy of leaves for witness construction
-    pub fn get_witness_data(&self, game_id: u128) -> Option<[Hash; 16]> {
+    pub fn get_game(&self, game_id: u128) -> Option<StoredGame> {
         let games = self.games.read().ok()?;
-        games.get(&game_id).copied()
+        games.get(&game_id).cloned()
     }
 
-    /// Check if the tiven game id already exists
-    pub fn game_exists(&self, game_id: u128) -> bool {
-        let games = self.games.read().expect("Lock poisoned");
-        games.contains_key(&game_id)
+    pub fn update_game(
+        &self,
+        game_id: u128,
+        new_root: Hash,
+        new_board: [Cell; 9],
+        new_turn: PlayerRole,
+    ) -> Result<(), String> {
+        let mut games = self.games.write().map_err(|_| "Lock poisoned")?;
+        let game = games.get_mut(&game_id).ok_or("Game not found")?;
+        game.root = new_root;
+        game.board = new_board;
+        game.turn = new_turn;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ttt_core::logic::{Cell, PlayerRole};
     use ttt_core::merkle::NULL_HASH;
 
     // Helper to create a dummy player pubkey
@@ -86,9 +83,15 @@ mod tests {
         [val; 32]
     }
 
-    // Helper to create a dummy board state
-    fn dummy_leaves() -> [Hash; 16] {
-        [NULL_HASH; 16]
+    // Helper to create a basic StoredGame
+    fn dummy_game() -> StoredGame {
+        StoredGame {
+            root: [0xAA; 32], // Dummy root
+            board: [Cell::Empty; 9],
+            turn: PlayerRole::X,
+            pk_x: dummy_player(1),
+            pk_o: dummy_player(2),
+        }
     }
 
     #[test]
@@ -116,41 +119,49 @@ mod tests {
     fn app_state_game_lifecycle() {
         let state = AppState::default();
         let game_id = 12345u128;
-        let leaves = dummy_leaves();
+        let game = dummy_game();
 
         // Initially game should not exist
         assert!(!state.game_exists(game_id));
-        assert!(state.get_witness_data(game_id).is_none());
+        assert!(state.get_game(game_id).is_none());
 
         // Create the game
-        state.create_game(game_id, leaves).expect("Creation failed");
+        state
+            .create_game(game_id, game.clone())
+            .expect("Creation failed");
         assert!(state.game_exists(game_id));
 
-        // Retrieve witness data
-        let retrieved = state.get_witness_data(game_id).expect("Data missing");
-        assert_eq!(retrieved, leaves);
+        // Retrieve and verify data
+        let retrieved = state.get_game(game_id).expect("Data missing");
+        assert_eq!(retrieved.root, game.root);
+        assert_eq!(retrieved.pk_x, game.pk_x);
 
-        // Update the game state
-        let mut new_leaves = leaves;
-        new_leaves[0] = [0xFF; 32]; // Simulate a move
+        // Update the game state (Simulate a move)
+        let new_root = [0xBB; 32];
+        let mut new_board = game.board;
+        new_board[0] = Cell::X;
+        let new_turn = PlayerRole::O;
+
         state
-            .update_game_state(game_id, new_leaves)
+            .update_game(game_id, new_root, new_board, new_turn)
             .expect("Update failed");
 
-        let updated = state.get_witness_data(game_id).unwrap();
-        assert_eq!(updated[0], [0xFF; 32]);
+        let updated = state.get_game(game_id).unwrap();
+        assert_eq!(updated.root, new_root);
+        assert_eq!(updated.board[0], Cell::X);
+        assert_eq!(updated.turn, PlayerRole::O);
     }
 
     #[test]
     fn create_game_conflict() {
         let state = AppState::default();
         let game_id = 999u128;
-        let leaves = dummy_leaves();
+        let game = dummy_game();
 
-        state.create_game(game_id, leaves).unwrap();
+        state.create_game(game_id, game.clone()).unwrap();
 
         // Attempting to create the same ID again should fail
-        let result = state.create_game(game_id, leaves);
+        let result = state.create_game(game_id, game);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already exists"));
     }
@@ -158,43 +169,8 @@ mod tests {
     #[test]
     fn update_non_existent_game() {
         let state = AppState::default();
-        let result = state.update_game_state(777, dummy_leaves());
+        let result = state.update_game(777, NULL_HASH, [Cell::Empty; 9], PlayerRole::X);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn sequential_id_generation() {
-        let state = AppState::default();
-
-        let id0 = state.get_next_game_id();
-        let id1 = state.get_next_game_id();
-        let id2 = state.get_next_game_id();
-
-        assert_eq!(id0, 0);
-        assert_eq!(id1, 1);
-        assert_eq!(id2, 2);
-    }
-
-    #[test]
-    fn concurrent_id_access() {
-        use std::sync::Arc;
-        use std::thread;
-
-        let state = Arc::new(AppState::default());
-        let mut handles = vec![];
-
-        // Spawn 10 threads each requesting an ID
-        for _ in 0..10 {
-            let s = Arc::clone(&state);
-            handles.push(thread::spawn(move || s.get_next_game_id()));
-        }
-
-        let mut results: Vec<u128> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        results.sort();
-
-        // Ensure we got 10 unique IDs from 0 to 9
-        for (i, result) in results.iter().enumerate() {
-            assert_eq!(*result, i as u128);
-        }
+        assert_eq!(result.unwrap_err(), "Game not found");
     }
 }

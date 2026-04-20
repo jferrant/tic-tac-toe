@@ -13,7 +13,6 @@ pub enum StfError {
     GameAlreadyInitialized,
     #[error("Game has not been initialized yet")]
     GameNotInitialized,
-    // Note: We use InvalidPlayer now to cover both identity and turn mismatches
     #[error("The provided public key does not match the player record")]
     InvalidPlayer,
     #[error("The target cell ({0}, {1}) is already occupied")]
@@ -45,7 +44,6 @@ pub const WIN_CONDITIONS: [[usize; 3]; 8] = [
     [0, 4, 8],
     [2, 4, 6],
 ];
-pub const BOARD_START_IDX: usize = 0;
 pub const BOARD_END_IDX: usize = 8;
 pub const PLAYER_X_IDX: usize = 9;
 pub const PLAYER_O_IDX: usize = 10;
@@ -87,26 +85,34 @@ impl PlayerRole {
     }
 }
 
-/// The authenticated state required to execute a single transition.
+/// The minimal witness for a single STF execution.
 ///
-/// The `Witness` contains a full snapshot of the Merkle Tree leaves. This allows
-/// the STF to verify the `prior_merkle_root_hash` and perform multiple atomic
-/// updates (e.g., updating a board cell AND the turn tracker) without requiring
-/// complex Merkle path surgery. The full path is required to verify a board win state anyway.
-pub struct Witness {
-    /// A complete array of all 16 leaves in the Merkle Tree.
-    /// Indices are mapped as follows:
-    /// - 0..=8:   Tic-Tac-Toe Board (Empty, X, or O)
-    /// - 9:       Player X Public Key Hash
-    /// - 10:      Player O Public Key Hash
-    /// - 11:      Turn Tracker (1 for X, 2 for O)
-    /// - 12..=15: Padding (NULL_HASH)
-    pub leaves: [Hash; 16],
-    /// The cryptographic proof that the player authorized this specific move
-    pub signature: [u8; 64],
+/// **Witness sizes:**
+/// - `CreateGame`: 64 bytes (signature only — prior state is always NULL_HASH)
+/// - `Play`: 9 (board) + 1 (turn) + 32 (other player pubkey) + 64 (sig) = **106 bytes**
+///
+/// Compare to the naive approach of passing all 16 × 32-byte leaves (576 bytes total).
+/// Savings come from:
+/// - Storing raw `Cell` values (1 byte) instead of their SHA-256 hashes (32 bytes each)
+/// - Omitting the current player's leaf (derived from `pubkey` already in the move)
+/// - Omitting padding leaves 12–15  (always `NULL_HASH`, fully deterministic)
+/// - Folding identity verification into the root check (wrong pubkey means wrong root)
+pub enum Witness {
+    CreateGame {
+        signature: [u8; 64],
+    },
+    Play {
+        /// Raw board values (9 bytes instead of 9 × 32-byte hashes)
+        board: [Cell; 9],
+        /// Whose turn it currently is (1 byte instead of a 32-byte hash)
+        turn: PlayerRole,
+        /// The OTHER player's raw pubkey, needed only to reconstruct the Merkle root.
+        /// The current player's pubkey comes from the `PlayerMove` itself.
+        other_player_pubkey: Player,
+        signature: [u8; 64],
+    },
 }
 
-/// A list of valid player moves
 #[derive(serde::Deserialize)]
 pub enum PlayerMove {
     CreateGame {
@@ -124,6 +130,7 @@ pub enum PlayerMove {
         coords: (usize, usize),
     },
 }
+
 impl PlayerMove {
     pub fn get_pubkey(&self) -> &Player {
         match self {
@@ -171,6 +178,37 @@ fn check_winner(leaves: &[Hash; 16]) -> Option<PlayerRole> {
     None
 }
 
+/// Reconstruct all 16 Merkle leaves from compact witness data.
+///
+/// The current player's leaf is derived from `current_pubkey` (present in the move).
+/// The other player's leaf is derived from `other_pubkey` (in the witness).
+/// Padding leaves 12–15 default to `NULL_HASH`.
+fn build_leaves(
+    current_pubkey: &Player,
+    other_pubkey: &Player,
+    board: &[Cell; 9],
+    turn: PlayerRole,
+) -> [Hash; 16] {
+    let mut leaves = [NULL_HASH; 16];
+    for (i, cell) in board.iter().enumerate() {
+        leaves[i] = hash_leaf(*cell as u8);
+    }
+    let current_leaf = hash_leaf_from_hash(hash_bytes(current_pubkey));
+    let other_leaf = hash_leaf_from_hash(hash_bytes(other_pubkey));
+    match turn {
+        PlayerRole::X => {
+            leaves[PLAYER_X_IDX] = current_leaf;
+            leaves[PLAYER_O_IDX] = other_leaf;
+        }
+        PlayerRole::O => {
+            leaves[PLAYER_X_IDX] = other_leaf;
+            leaves[PLAYER_O_IDX] = current_leaf;
+        }
+    }
+    leaves[TURN_TRACKER_IDX] = hash_leaf(turn as u8);
+    leaves
+}
+
 /// Initialize the game by building the full Merkle Tree with all 16 leaves
 pub fn init_game(pubkey_x: &Player, pubkey_y: &Player) -> (Hash, [[u8; 32]; 16]) {
     // Start with an array where every leaf is the NULL_HASH constant
@@ -194,34 +232,6 @@ pub fn init_game(pubkey_x: &Player, pubkey_y: &Player) -> (Hash, [[u8; 32]; 16])
     // This distinguishes "game state" leaves from "padding" leaves.
 
     (compute_root_from_leaves(&leaves), leaves)
-}
-
-/// Pure function to verify that the provided public key belongs to the
-/// player authorized to move in the current state.
-fn verify_identity_matches_state(
-    pubkey: &Player,
-    leaves: &[Hash; 16],
-) -> Result<PlayerRole, StfError> {
-    // Identify current role from turn tracker
-    let turn_hash = leaves[TURN_TRACKER_IDX];
-    let current_role = if turn_hash == hash_leaf(PlayerRole::X as u8) {
-        PlayerRole::X
-    } else if turn_hash == hash_leaf(PlayerRole::O as u8) {
-        PlayerRole::O
-    } else {
-        return Err(StfError::InvalidTurnValue);
-    };
-
-    // Reconstruct the leaf for the provided pubkey
-    // This MUST match the logic in init_game: hash_leaf_from_hash(hash_bytes(key))
-    let identity_leaf = hash_leaf_from_hash(hash_bytes(pubkey));
-
-    // Check current role's registered key in the state
-    if leaves[current_role.pubkey_index()] != identity_leaf {
-        return Err(StfError::InvalidPlayer);
-    }
-
-    Ok(current_role)
 }
 
 /// Deterministically serializes a move and the prior state into a message for signing.
@@ -258,80 +268,94 @@ pub fn verify_signature(
     signature_bytes: &[u8; 64],
 ) -> Result<(), StfError> {
     let public_key = VerifyingKey::from_bytes(pubkey).map_err(|_| StfError::InvalidPlayer)?;
-
     let signature = Signature::from_bytes(signature_bytes);
-
     public_key
         .verify(message, &signature)
         .map_err(|_| StfError::InvalidSignature)
 }
 
-/// The State Transition Function (STF) that determines if a move is valid or not
-/// Ensures that create game is only called once and enforces all tic-tac-toe rules
-/// The STF is stateless, using the Merkle Tree to construct its state each time
+/// Pure State Transition Function.
+///
+/// Returns `(new_merkle_root, Option<winner_pubkey>)`.
+///
+/// For `Play`, identity verification is folded into the root check: providing the
+/// wrong pubkey (wrong player, wrong turn) produces a different root, which fails
+/// the `compute_root_from_leaves(...) != prior_merkle_root_hash` check. No separate
+/// identity comparison is needed.
 pub fn stf(
     prior_merkle_root_hash: Hash,
     player_move: &PlayerMove,
     witness: &Witness,
-) -> Result<(Hash, [Hash; 16], Option<Winner>), StfError> {
-    // Authentication (Always verify signature matches the move intent)
-    let pubkey = player_move.get_pubkey();
-    let message = format_auth_message(player_move, prior_merkle_root_hash);
-    verify_signature(pubkey, &message, &witness.signature)?;
+) -> Result<(Hash, Option<Winner>), StfError> {
+    match (player_move, witness) {
+        (
+            PlayerMove::CreateGame {
+                pubkey_x, pubkey_y, ..
+            },
+            Witness::CreateGame { signature },
+        ) => {
+            let message = format_auth_message(player_move, prior_merkle_root_hash);
+            verify_signature(pubkey_x, &message, signature)?;
 
-    match player_move {
-        PlayerMove::CreateGame {
-            pubkey_x, pubkey_y, ..
-        } => {
             if prior_merkle_root_hash != NULL_HASH {
                 return Err(StfError::GameAlreadyInitialized);
             }
             if pubkey_x == pubkey_y {
                 return Err(StfError::IdenticalPlayerKeys);
             }
-
-            // Note: We don't call verify_identity_matches_state here because the state is empty.
-            let (new_hash, new_leaves) = init_game(pubkey_x, pubkey_y);
-            Ok((new_hash, new_leaves, None))
+            let (new_root, _) = init_game(pubkey_x, pubkey_y);
+            Ok((new_root, None))
         }
-        PlayerMove::Play { pubkey, coords } => {
-            // We don't have a game yet..
-            // Integrity: Check the witness matches our prior merkle root hash
-            let calculated_root = compute_root_from_leaves(&witness.leaves);
-            if calculated_root != prior_merkle_root_hash {
-                return Err(StfError::InvalidMerkleProof);
-            }
+        (
+            PlayerMove::Play { pubkey, coords },
+            Witness::Play {
+                board,
+                turn,
+                other_player_pubkey,
+                signature,
+            },
+        ) => {
+            let message = format_auth_message(player_move, prior_merkle_root_hash);
+            verify_signature(pubkey, &message, signature)?;
+
             if prior_merkle_root_hash == NULL_HASH {
                 return Err(StfError::GameNotInitialized);
             }
 
-            // Turn/Identity Verification (Specific to Play move)
-            let current_role = verify_identity_matches_state(pubkey, &witness.leaves)?;
+            // Build leaves and verify root. This single check simultaneously verifies:
+            // - The board state is correct
+            // - The turn tracker is correct
+            // - The current player's pubkey matches the registered player for this turn
+            let leaves = build_leaves(pubkey, other_player_pubkey, board, *turn);
+            if compute_root_from_leaves(&leaves) != prior_merkle_root_hash {
+                return Err(StfError::InvalidMerkleProof);
+            }
 
-            if check_winner(&witness.leaves).is_some() {
+            if check_winner(&leaves).is_some() {
                 return Err(StfError::GameAlreadyFinished);
             }
 
             let board_idx = convert_coordinates_to_index(coords.0, coords.1)?;
-            if witness.leaves[board_idx] != hash_leaf(Cell::Empty as u8) {
+            if board[board_idx] != Cell::Empty {
                 return Err(StfError::CellNotEmpty(coords.0, coords.1));
             }
-            // State transition
-            let mut new_leaves = witness.leaves;
-            new_leaves[board_idx] = hash_leaf(current_role as u8);
-            new_leaves[TURN_TRACKER_IDX] = hash_leaf(current_role.next() as u8);
+
+            let mut new_leaves = leaves;
+            new_leaves[board_idx] = hash_leaf(*turn as u8);
+            new_leaves[TURN_TRACKER_IDX] = hash_leaf(turn.next() as u8);
 
             let winner = if let Some(winner_role) = check_winner(&new_leaves) {
-                // This should not ever happen...
-                if winner_role != current_role {
+                if winner_role != *turn {
                     return Err(StfError::InvalidState);
                 }
                 Some(*pubkey)
             } else {
                 None
             };
-            Ok((compute_root_from_leaves(&new_leaves), new_leaves, winner))
+
+            Ok((compute_root_from_leaves(&new_leaves), winner))
         }
+        _ => Err(StfError::InvalidMerkleProof),
     }
 }
 
@@ -353,6 +377,10 @@ mod test {
         sk.sign(&message).to_bytes()
     }
 
+    fn root_for(pk_x: &Player, pk_o: &Player, board: &[Cell; 9], turn: PlayerRole) -> Hash {
+        compute_root_from_leaves(&build_leaves(pk_x, pk_o, board, turn))
+    }
+
     #[test]
     fn win_detection_and_locking() {
         let sk_x = signing_key(&[1u8; 32]);
@@ -360,69 +388,89 @@ mod test {
         let pk_x = verifying_key(&[1u8; 32]);
         let pk_o = verifying_key(&[2u8; 32]);
 
-        // Setup: X is about to win on the top row [X, X, _]
-        let mut leaves = [hash_leaf(Cell::Empty as u8); 16];
-        leaves[0] = hash_leaf(Cell::X as u8);
-        leaves[1] = hash_leaf(Cell::X as u8);
-        leaves[PLAYER_X_IDX] = hash_leaf_from_hash(hash_bytes(&pk_x));
-        leaves[PLAYER_O_IDX] = hash_leaf_from_hash(hash_bytes(&pk_o));
-        leaves[TURN_TRACKER_IDX] = hash_leaf(PlayerRole::X as u8);
+        // Board: [X, X, _, ...], X to play at (2, 0) for the win
+        let board = [
+            Cell::X,
+            Cell::X,
+            Cell::Empty,
+            Cell::Empty,
+            Cell::Empty,
+            Cell::Empty,
+            Cell::Empty,
+            Cell::Empty,
+            Cell::Empty,
+        ];
+        let prior_root = root_for(&pk_x, &pk_o, &board, PlayerRole::X);
 
-        let prior_root = compute_root_from_leaves(&leaves);
         let move_x = PlayerMove::Play {
             pubkey: pk_x,
             coords: (2, 0),
         };
-
-        let witness = Witness {
-            leaves,
+        let witness = Witness::Play {
+            board,
+            turn: PlayerRole::X,
+            other_player_pubkey: pk_o,
             signature: sign_move(&sk_x, &move_x, prior_root),
         };
 
-        let (new_root, new_leaves, winner) =
-            stf(prior_root, &move_x, &witness).expect("Winning move failed");
+        let (new_root, winner) = stf(prior_root, &move_x, &witness).expect("Winning move failed");
+        assert_eq!(winner, Some(pk_x));
 
-        assert_eq!(winner, Some(pk_x), "X should be declared winner");
-
-        // Attempt O move after X has already won
+        // O tries to move after X has won
+        let won_board = [
+            Cell::X,
+            Cell::X,
+            Cell::X,
+            Cell::Empty,
+            Cell::Empty,
+            Cell::Empty,
+            Cell::Empty,
+            Cell::Empty,
+            Cell::Empty,
+        ];
         let move_o = PlayerMove::Play {
             pubkey: pk_o,
             coords: (0, 1),
         };
-
-        let won_witness = Witness {
-            leaves: new_leaves,
+        let won_witness = Witness::Play {
+            board: won_board,
+            turn: PlayerRole::O,
+            other_player_pubkey: pk_x,
             signature: sign_move(&sk_o, &move_o, new_root),
         };
 
-        let result = stf(new_root, &move_o, &won_witness);
-        assert_eq!(result.unwrap_err(), StfError::GameAlreadyFinished);
+        assert_eq!(
+            stf(new_root, &move_o, &won_witness).unwrap_err(),
+            StfError::GameAlreadyFinished
+        );
     }
 
     #[test]
     fn check_invalid_player_identity() {
         let pk_x = verifying_key(&[1u8; 32]);
+        let pk_o = verifying_key(&[2u8; 32]);
         let sk_attacker = signing_key(&[9u8; 32]);
         let attacker_pk = verifying_key(&[9u8; 32]);
 
-        let mut leaves = [hash_leaf(Cell::Empty as u8); 16];
-        leaves[PLAYER_X_IDX] = hash_leaf_from_hash(hash_bytes(&pk_x));
-        leaves[TURN_TRACKER_IDX] = hash_leaf(PlayerRole::X as u8);
-
-        let prior_root = compute_root_from_leaves(&leaves);
+        let board = [Cell::Empty; 9];
+        let prior_root = root_for(&pk_x, &pk_o, &board, PlayerRole::X);
 
         let move_attack = PlayerMove::Play {
             pubkey: attacker_pk,
             coords: (0, 0),
         };
-
-        let witness = Witness {
-            leaves,
+        // Attacker claims to be the current player but their pubkey doesn't match the root
+        let witness = Witness::Play {
+            board,
+            turn: PlayerRole::X,
+            other_player_pubkey: pk_o,
             signature: sign_move(&sk_attacker, &move_attack, prior_root),
         };
 
-        let result = stf(prior_root, &move_attack, &witness);
-        assert_eq!(result.unwrap_err(), StfError::InvalidPlayer);
+        assert_eq!(
+            stf(prior_root, &move_attack, &witness).unwrap_err(),
+            StfError::InvalidMerkleProof
+        );
     }
 
     #[test]
@@ -431,25 +479,26 @@ mod test {
         let pk_x = verifying_key(&[1u8; 32]);
         let pk_o = verifying_key(&[2u8; 32]);
 
-        let mut leaves = [hash_leaf(Cell::Empty as u8); 16];
-        leaves[PLAYER_X_IDX] = hash_leaf_from_hash(hash_bytes(&pk_x));
-        leaves[PLAYER_O_IDX] = hash_leaf_from_hash(hash_bytes(&pk_o));
-        leaves[TURN_TRACKER_IDX] = hash_leaf(PlayerRole::O as u8); // It's O's turn
+        let board = [Cell::Empty; 9];
+        // Prior state: it is O's turn
+        let prior_root = root_for(&pk_o, &pk_x, &board, PlayerRole::O);
 
-        let prior_root = compute_root_from_leaves(&leaves);
-
+        // X submits a witness claiming it's X's turn — root won't match
         let move_x = PlayerMove::Play {
             pubkey: pk_x,
             coords: (0, 0),
         };
-
-        let witness = Witness {
-            leaves,
+        let witness = Witness::Play {
+            board,
+            turn: PlayerRole::X,
+            other_player_pubkey: pk_o,
             signature: sign_move(&sk_x, &move_x, prior_root),
         };
 
-        let result = stf(prior_root, &move_x, &witness);
-        assert_eq!(result.unwrap_err(), StfError::InvalidPlayer);
+        assert_eq!(
+            stf(prior_root, &move_x, &witness).unwrap_err(),
+            StfError::InvalidMerkleProof
+        );
     }
 
     #[test]
@@ -457,20 +506,25 @@ mod test {
         let sk_x = signing_key(&[1u8; 32]);
         let pk_x = verifying_key(&[1u8; 32]);
         let pk_o = verifying_key(&[2u8; 32]);
-        let (root, leaves) = init_game(&pk_x, &pk_o);
+
+        let board = [Cell::Empty; 9];
+        let prior_root = root_for(&pk_x, &pk_o, &board, PlayerRole::X);
 
         let move_bad = PlayerMove::Play {
             pubkey: pk_x,
             coords: (3, 0),
         };
-
-        let witness = Witness {
-            leaves,
-            signature: sign_move(&sk_x, &move_bad, root),
+        let witness = Witness::Play {
+            board,
+            turn: PlayerRole::X,
+            other_player_pubkey: pk_o,
+            signature: sign_move(&sk_x, &move_bad, prior_root),
         };
 
-        let result = stf(root, &move_bad, &witness);
-        assert_eq!(result.unwrap_err(), StfError::OutOfBounds(3, 0));
+        assert_eq!(
+            stf(prior_root, &move_bad, &witness).unwrap_err(),
+            StfError::OutOfBounds(3, 0)
+        );
     }
 
     #[test]
@@ -479,27 +533,28 @@ mod test {
         let pk_x = verifying_key(&[1u8; 32]);
         let pk_o = verifying_key(&[2u8; 32]);
 
-        let (prior_root, leaves) = init_game(&pk_x, &pk_o);
+        let board = [Cell::Empty; 9];
+        let prior_root = root_for(&pk_x, &pk_o, &board, PlayerRole::X);
+
         let move_x = PlayerMove::Play {
             pubkey: pk_x,
             coords: (0, 0),
         };
-
-        let witness = Witness {
-            leaves,
+        let witness = Witness::Play {
+            board,
+            turn: PlayerRole::X,
+            other_player_pubkey: pk_o,
             signature: sign_move(&sk_x, &move_x, prior_root),
         };
 
-        let (new_root, new_leaves, winner) =
-            stf(prior_root, &move_x, &witness).expect("X move failed");
-
-        let mut expected_leaves = leaves;
-        expected_leaves[0] = hash_leaf(Cell::X as u8);
-        expected_leaves[TURN_TRACKER_IDX] = hash_leaf(PlayerRole::O as u8);
-
-        assert_eq!(new_leaves, expected_leaves);
-        assert_eq!(new_root, compute_root_from_leaves(&expected_leaves));
+        let (new_root, winner) = stf(prior_root, &move_x, &witness).expect("X move failed");
         assert!(winner.is_none());
+
+        // Verify the new root matches what we'd expect for the updated state
+        let mut expected_board = board;
+        expected_board[0] = Cell::X;
+        let expected_root = root_for(&pk_o, &pk_x, &expected_board, PlayerRole::O);
+        assert_eq!(new_root, expected_root);
     }
 
     #[test]
@@ -510,9 +565,8 @@ mod test {
 
         // X O X
         // X O O
-        // O X _  <- X is about to move here
-        let (_, mut leaves) = init_game(&pk_x, &pk_o);
-        let cells = [
+        // O X _  <- X plays (2, 2) for the draw
+        let board = [
             Cell::X,
             Cell::O,
             Cell::X,
@@ -523,76 +577,87 @@ mod test {
             Cell::X,
             Cell::Empty,
         ];
-        for (i, cell) in cells.iter().enumerate() {
-            leaves[i] = hash_leaf(*cell as u8);
-        }
-        leaves[TURN_TRACKER_IDX] = hash_leaf(PlayerRole::X as u8);
+        let prior_root = root_for(&pk_x, &pk_o, &board, PlayerRole::X);
 
-        let root = compute_root_from_leaves(&leaves);
         let move_x = PlayerMove::Play {
             pubkey: pk_x,
             coords: (2, 2),
         };
-
-        let witness = Witness {
-            leaves,
-            signature: sign_move(&sk_x, &move_x, root),
+        let witness = Witness::Play {
+            board,
+            turn: PlayerRole::X,
+            other_player_pubkey: pk_o,
+            signature: sign_move(&sk_x, &move_x, prior_root),
         };
 
-        let (_, _, winner) = stf(root, &move_x, &witness).expect("Draw move failed");
-        assert!(winner.is_none(), "There should be no winner in a draw");
+        let (_, winner) = stf(prior_root, &move_x, &witness).expect("Draw move failed");
+        assert!(winner.is_none());
     }
+
     #[test]
     fn cell_already_occupied() {
         let sk_o = signing_key(&[2u8; 32]);
         let pk_x = verifying_key(&[1u8; 32]);
         let pk_o = verifying_key(&[2u8; 32]);
 
-        let (_, mut leaves) = init_game(&pk_x, &pk_o);
-
-        // X already at (0,0), it's O's turn
-        leaves[0] = hash_leaf(Cell::X as u8);
-        leaves[TURN_TRACKER_IDX] = hash_leaf(PlayerRole::O as u8);
-
-        let root = compute_root_from_leaves(&leaves);
+        // X has already played at (0, 0), O tries the same cell
+        let board = [
+            Cell::X,
+            Cell::Empty,
+            Cell::Empty,
+            Cell::Empty,
+            Cell::Empty,
+            Cell::Empty,
+            Cell::Empty,
+            Cell::Empty,
+            Cell::Empty,
+        ];
+        let prior_root = root_for(&pk_o, &pk_x, &board, PlayerRole::O);
 
         let move_o = PlayerMove::Play {
             pubkey: pk_o,
             coords: (0, 0),
         };
-
-        let witness = Witness {
-            leaves,
-            signature: sign_move(&sk_o, &move_o, root),
+        let witness = Witness::Play {
+            board,
+            turn: PlayerRole::O,
+            other_player_pubkey: pk_x,
+            signature: sign_move(&sk_o, &move_o, prior_root),
         };
 
-        let result = stf(root, &move_o, &witness);
-
-        assert_eq!(result.unwrap_err(), StfError::CellNotEmpty(0, 0));
+        assert_eq!(
+            stf(prior_root, &move_o, &witness).unwrap_err(),
+            StfError::CellNotEmpty(0, 0)
+        );
     }
+
     #[test]
     fn invalid_merkle_witness() {
         let sk_x = signing_key(&[1u8; 32]);
         let pk_x = verifying_key(&[1u8; 32]);
         let pk_o = verifying_key(&[2u8; 32]);
-        let (trusted_root, leaves) = init_game(&pk_x, &pk_o);
+
+        let board = [Cell::Empty; 9];
+        let (trusted_root, _) = init_game(&pk_x, &pk_o);
 
         let move_x = PlayerMove::Play {
             pubkey: pk_x,
             coords: (0, 0),
         };
-
-        // Corrupt the witness by changing a padding leaf (index 15)
-        let mut corrupt_leaves = leaves;
-        corrupt_leaves[15] = hash_leaf(99);
-
-        let witness = Witness {
-            leaves: corrupt_leaves,
+        // Provide a tampered board that doesn't match trusted_root
+        let mut bad_board = board;
+        bad_board[5] = Cell::X;
+        let witness = Witness::Play {
+            board: bad_board,
+            turn: PlayerRole::X,
+            other_player_pubkey: pk_o,
             signature: sign_move(&sk_x, &move_x, trusted_root),
         };
 
-        let result = stf(trusted_root, &move_x, &witness);
-        assert_eq!(result.unwrap_err(), StfError::InvalidMerkleProof);
+        assert_eq!(
+            stf(trusted_root, &move_x, &witness).unwrap_err(),
+            StfError::InvalidMerkleProof
+        );
     }
 
     #[test]
@@ -600,22 +665,27 @@ mod test {
         let sk_x = signing_key(&[1u8; 32]);
         let pk_x = verifying_key(&[1u8; 32]);
         let pk_o = verifying_key(&[2u8; 32]);
-        let (root, leaves) = init_game(&pk_x, &pk_o);
+
+        let board = [Cell::Empty; 9];
+        let prior_root = root_for(&pk_x, &pk_o, &board, PlayerRole::X);
 
         let move_x = PlayerMove::Play {
             pubkey: pk_x,
             coords: (0, 0),
         };
+        let mut sig = sign_move(&sk_x, &move_x, prior_root);
+        sig[0] ^= 0xFF;
 
-        let mut witness = Witness {
-            leaves,
-            signature: sign_move(&sk_x, &move_x, root),
+        let witness = Witness::Play {
+            board,
+            turn: PlayerRole::X,
+            other_player_pubkey: pk_o,
+            signature: sig,
         };
 
-        // Corrupt the signature by flipping bits
-        witness.signature[0] ^= 0xFF;
-
-        let result = stf(root, &move_x, &witness);
-        assert_eq!(result.unwrap_err(), StfError::InvalidSignature);
+        assert_eq!(
+            stf(prior_root, &move_x, &witness).unwrap_err(),
+            StfError::InvalidSignature
+        );
     }
 }
