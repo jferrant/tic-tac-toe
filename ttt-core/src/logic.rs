@@ -21,8 +21,6 @@ pub enum StfError {
     OutOfBounds(usize, usize),
     #[error("Player X and Player O cannot have the same public key")]
     IdenticalPlayerKeys,
-    #[error("Invalid turn value found in state. Must be 1 (X) or 2 (O)")]
-    InvalidTurnValue,
     #[error("The game has already been won by another player")]
     GameAlreadyFinished,
     #[error("The game entered into an invalid state.")]
@@ -75,14 +73,6 @@ impl PlayerRole {
             PlayerRole::O => PlayerRole::X,
         }
     }
-
-    /// Get the index into the merkle tree for the player's pubkey
-    pub fn pubkey_index(&self) -> usize {
-        match self {
-            PlayerRole::X => PLAYER_X_IDX,
-            PlayerRole::O => PLAYER_O_IDX,
-        }
-    }
 }
 
 /// The minimal witness for a single STF execution.
@@ -129,17 +119,6 @@ pub enum PlayerMove {
         /// The cell coordinates being modified
         coords: (usize, usize),
     },
-}
-
-impl PlayerMove {
-    pub fn get_pubkey(&self) -> &Player {
-        match self {
-            PlayerMove::CreateGame {
-                pubkey_x: pubkey, ..
-            }
-            | PlayerMove::Play { pubkey, .. } => pubkey,
-        }
-    }
 }
 
 /// The public key of a player
