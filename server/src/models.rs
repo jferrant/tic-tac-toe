@@ -84,8 +84,13 @@ mod tests {
         };
 
         let m: PlayerMove = req.into();
-        
-        if let PlayerMove::CreateGame { pubkey_x, pubkey_y, nonce } = m {
+
+        if let PlayerMove::CreateGame {
+            pubkey_x,
+            pubkey_y,
+            nonce,
+        } = m
+        {
             assert_eq!(pubkey_x, [1u8; 32]);
             assert_eq!(pubkey_y, [2u8; 32]);
             assert_eq!(nonce, 42);
@@ -129,10 +134,16 @@ mod tests {
 
         // Failure case: too short
         req.signature = vec![0u8; 63];
-        assert_eq!(req.signature_bytes().unwrap_err(), "Invalid signature length");
+        assert_eq!(
+            req.signature_bytes().unwrap_err(),
+            "Invalid signature length"
+        );
 
         // Failure case: too long
         req.signature = vec![0u8; 65];
-        assert_eq!(req.signature_bytes().unwrap_err(), "Invalid signature length");
+        assert_eq!(
+            req.signature_bytes().unwrap_err(),
+            "Invalid signature length"
+        );
     }
 }

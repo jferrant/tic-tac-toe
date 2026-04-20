@@ -18,12 +18,14 @@ pub async fn handle_create(
     let nonce = payload.nonce;
     let pubkey_x = payload.pubkey_x;
     let pubkey_y = payload.pubkey_y;
-    let signature = payload.signature_bytes().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let signature = payload
+        .signature_bytes()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     let core_move = PlayerMove::from(payload);
-    
+
     // Setup the "Genesis" Witness
     // CreateGame is signed against NULL_HASH per our format_auth_message logic
-    let initial_root = NULL_HASH; 
+    let initial_root = NULL_HASH;
     let witness = Witness {
         leaves: [NULL_HASH; 16],
         signature,
@@ -37,7 +39,7 @@ pub async fn handle_create(
 
     // Generate the ID and persist
     let game_id = generate_game_id(&pubkey_x, &pubkey_y, nonce);
-    
+
     if state.game_exists(game_id) {
         return Err(StatusCode::CONFLICT);
     }
@@ -57,12 +59,14 @@ pub async fn handle_play(
     let leaves = state.get_witness_data(gid).ok_or(StatusCode::NOT_FOUND)?;
     let prior_root = compute_root_from_leaves(&leaves);
 
-    let sig_bytes = payload.signature_bytes().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let sig_bytes = payload
+        .signature_bytes()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     let core_move = PlayerMove::from(payload);
-    
-    let witness = Witness { 
-        leaves, 
-        signature: sig_bytes 
+
+    let witness = Witness {
+        leaves,
+        signature: sig_bytes,
     };
 
     // The STF does the heavy lifting:

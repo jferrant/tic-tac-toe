@@ -133,7 +133,9 @@ mod tests {
         // Update the game state
         let mut new_leaves = leaves;
         new_leaves[0] = [0xFF; 32]; // Simulate a move
-        state.update_game_state(game_id, new_leaves).expect("Update failed");
+        state
+            .update_game_state(game_id, new_leaves)
+            .expect("Update failed");
 
         let updated = state.get_witness_data(game_id).unwrap();
         assert_eq!(updated[0], [0xFF; 32]);
@@ -146,7 +148,7 @@ mod tests {
         let leaves = dummy_leaves();
 
         state.create_game(game_id, leaves).unwrap();
-        
+
         // Attempting to create the same ID again should fail
         let result = state.create_game(game_id, leaves);
         assert!(result.is_err());
@@ -163,7 +165,7 @@ mod tests {
     #[test]
     fn sequential_id_generation() {
         let state = AppState::default();
-        
+
         let id0 = state.get_next_game_id();
         let id1 = state.get_next_game_id();
         let id2 = state.get_next_game_id();
@@ -172,7 +174,7 @@ mod tests {
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
     }
-    
+
     #[test]
     fn concurrent_id_access() {
         use std::sync::Arc;
@@ -184,9 +186,7 @@ mod tests {
         // Spawn 10 threads each requesting an ID
         for _ in 0..10 {
             let s = Arc::clone(&state);
-            handles.push(thread::spawn(move || {
-                s.get_next_game_id()
-            }));
+            handles.push(thread::spawn(move || s.get_next_game_id()));
         }
 
         let mut results: Vec<u128> = handles.into_iter().map(|h| h.join().unwrap()).collect();
