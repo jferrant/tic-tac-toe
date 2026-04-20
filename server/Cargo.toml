@@ -5,10 +5,13 @@ edition = "2021"
 
 [dependencies]
 ttt-core = { path = "../ttt-core" }
-proto = { path = "../proto" }
+ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 serde = { version = "1.0.228", features = ["derive"] }
 axum = "0.8.9"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tokio = { version = "1.52.1", features = ["rt-multi-thread", "macros", "signal"] }
 clap = { version = "4.6.1", features = ["derive"] }
+rand = "0.8"
+reqwest = { version = "0.13.2", features = ["json"] }
+hex = "0.4.3"

@@ -2,6 +2,5 @@
 members = [
     "ttt-core",
     "server",
-    "proto"
 ]
 resolver = "2"

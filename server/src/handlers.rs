@@ -27,7 +27,8 @@ pub async fn handle_create(
     // CreateGame is signed against NULL_HASH per our format_auth_message logic
     let initial_root = NULL_HASH;
     let witness = Witness {
-        leaves: [NULL_HASH; 16],
+        // If your board is 9 squares, ensure this matches the STF's expected empty state
+        leaves: [NULL_HASH; 16], // Ensure this matches the [Hash; N] type in Witness
         signature,
     };
 

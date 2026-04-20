@@ -172,7 +172,7 @@ fn check_winner(leaves: &[Hash; 16]) -> Option<PlayerRole> {
 }
 
 /// Initialize the game by building the full Merkle Tree with all 16 leaves
-fn init_game(pubkey_x: &Player, pubkey_y: &Player) -> (Hash, [[u8; 32]; 16]) {
+pub fn init_game(pubkey_x: &Player, pubkey_y: &Player) -> (Hash, [[u8; 32]; 16]) {
     // Start with an array where every leaf is the NULL_HASH constant
     let mut leaves = [NULL_HASH; TREE_SIZE];
 
@@ -274,12 +274,6 @@ pub fn stf(
     player_move: &PlayerMove,
     witness: &Witness,
 ) -> Result<(Hash, [Hash; 16], Option<Winner>), StfError> {
-    // Integrity: Check the witness matches our prior merkle root hash
-    let calculated_root = compute_root_from_leaves(&witness.leaves);
-    if calculated_root != prior_merkle_root_hash {
-        return Err(StfError::InvalidMerkleProof);
-    }
-
     // Authentication (Always verify signature matches the move intent)
     let pubkey = player_move.get_pubkey();
     let message = format_auth_message(player_move, prior_merkle_root_hash);
@@ -302,6 +296,11 @@ pub fn stf(
         }
         PlayerMove::Play { pubkey, coords } => {
             // We don't have a game yet..
+            // Integrity: Check the witness matches our prior merkle root hash
+            let calculated_root = compute_root_from_leaves(&witness.leaves);
+            if calculated_root != prior_merkle_root_hash {
+                return Err(StfError::InvalidMerkleProof);
+            }
             if prior_merkle_root_hash == NULL_HASH {
                 return Err(StfError::GameNotInitialized);
             }

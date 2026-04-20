@@ -11,23 +11,20 @@ use tokio::net::TcpListener;
 
 use axum::{routing::post, Router};
 
-use crate::{
+use server::{
     handlers::{handle_create, handle_play},
     state::AppState,
 };
-pub mod handlers;
-pub mod models;
-pub mod state;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Tic-Tac-Toe Game Server")]
 struct Args {
     /// Port to listen on
-    #[arg(short, long, default_value_t = 3000)]
+    #[arg(long, default_value_t = 3000)]
     port: u16,
 
     /// Host address to bind to
-    #[arg(short, long, default_value = "127.0.0.1")]
+    #[arg(long, default_value = "127.0.0.1")]
     host: String,
 }
 
