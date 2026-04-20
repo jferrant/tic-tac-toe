@@ -88,5 +88,9 @@ pub async fn handle_play(
         info!("WINNER! {winner_pk:?} won game {gid}");
     }
 
-    Ok(Json(PlayResponse { new_root, winner }))
+    Ok(Json(PlayResponse {
+        new_root,
+        new_leaves,
+        winner,
+    }))
 }
