@@ -1,8 +1,9 @@
-//! # Tic-Tac-Toe ZK-Server
+//! Entry point for the Tic-Tac-Toe game server.
 //!
-//! This crate will impelement the stateful coordinator and "Prover" for the
-//! zkVM-provable Tic-Tac-Toe game. It will bridge the gap between signed user
-//! actions and the pure State Transition Function (STF).
+//! Starts the Axum HTTP server and registers three routes:
+//! - `POST /game/create`     — initialize a new game
+//! - `POST /game/play`       — submit a single authenticated move
+//! - `POST /game/play_batch` — submit multiple moves in one request
 
 use clap::Parser;
 use std::net::SocketAddr;

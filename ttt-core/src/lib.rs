@@ -1,14 +1,14 @@
-//! # Tic-Tac-Toe ZK-STF
+//! Pure game logic for ZK-verifiable Tic-Tac-Toe.
 //!
-//! This crate will implement the pure logic for a verifiable Tic-Tac-Toe game.
-//! It will use a manual Merkle Tree implementation to satisfy the constraint of
-//! non-compact state representation.
+//! This crate has no I/O or server dependencies and can be compiled directly
+//! into a zkVM guest. It exposes two entry points:
+//!
+//! - [`logic::stf`] — verify and apply a single authenticated move
+//! - [`logic::batch_stf`] — verify and apply a sequence of moves in one shot
+//!
+//! All game state is committed to a 16-leaf SHA-256 Merkle tree (see [`merkle`]).
+//! The Merkle root is the sole public input to the STF; the witness supplies the
+//! compact pre-image data needed to reconstruct and check it.
 
 pub mod logic;
-/// A custom Merkle Tree implementation tailored for a 3x3 Tic-Tac-Toe board.
-///
-/// Since the board contains 9 cells, we use a fixed-height tree of 4 levels
-/// (2^4 = 16 leaves) to provide ample capacity. The implementation uses
-/// bitwise navigation to determine whether a given index follows a left
-/// or right path during root reconstruction.
 pub mod merkle;
